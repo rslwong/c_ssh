@@ -7,8 +7,23 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/time.h>
 
 #define PORT 8022
+
+int load_config_port() {
+    int parsed_port = PORT;
+    FILE *f = fopen("c_ssh_config", "r");
+    if (!f) return parsed_port;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "PORT=", 5) == 0) {
+            parsed_port = atoi(line + 5);
+        }
+    }
+    fclose(f);
+    return parsed_port;
+}
 
 int read_until_newline(int fd, char* buf, int max_len) {
     int i = 0;
@@ -26,13 +41,15 @@ int connect_to_server(const char* ip) {
     int sock = 0;
     struct sockaddr_in serv_addr;
     
+    int active_port = load_config_port();
+    
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         printf("\n Socket creation error \n");
         exit(1);
     }
     
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_port = htons(active_port);
     
     if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
         printf("\nInvalid address/ Address not supported \n");
@@ -58,9 +75,11 @@ void push_file(const char* ip, const char* local_file, const char* remote_file) 
         return;
     }
     long size = st.st_size;
+    long file_mode = st.st_mode & 0777;
+    long mtime = st.st_mtime;
     
     char header[1024];
-    snprintf(header, sizeof(header), "%s\n%ld\n", remote_file, size);
+    snprintf(header, sizeof(header), "%s\n%ld\n%lo\n%ld\n", remote_file, size, file_mode, mtime);
     write(sock, header, strlen(header));
     
     char resp[16];
@@ -96,7 +115,7 @@ void pull_file(const char* ip, const char* remote_file, const char* local_file) 
     snprintf(header, sizeof(header), "%s\n", remote_file);
     write(sock, header, strlen(header));
     
-    char resp[128];
+    char resp[128], mode_str[128], mtime_str[128];
     read_until_newline(sock, resp, sizeof(resp));
     long size = atol(resp);
     if(size < 0) {
@@ -105,7 +124,14 @@ void pull_file(const char* ip, const char* remote_file, const char* local_file) 
         return;
     }
     
-    int fd = open(local_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    read_until_newline(sock, mode_str, sizeof(mode_str));
+    long file_mode = strtol(mode_str, NULL, 8);
+    if (file_mode == 0) file_mode = 0644;
+    
+    read_until_newline(sock, mtime_str, sizeof(mtime_str));
+    long mtime = atol(mtime_str);
+    
+    int fd = open(local_file, O_WRONLY | O_CREAT | O_TRUNC, file_mode);
     if (fd < 0) {
         perror("open local file failed");
         close(sock);
@@ -125,6 +151,13 @@ void pull_file(const char* ip, const char* remote_file, const char* local_file) 
     }
     printf("\nDownload complete.\n");
     close(fd);
+    
+    struct timeval tv[2];
+    tv[0].tv_sec = mtime; tv[0].tv_usec = 0;
+    tv[1].tv_sec = mtime; tv[1].tv_usec = 0;
+    utimes(local_file, tv);
+    chmod(local_file, file_mode);
+    
     close(sock);
 }
 

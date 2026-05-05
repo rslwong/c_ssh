@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8022
 
@@ -25,11 +27,11 @@ int load_config_port() {
     return parsed_port;
 }
 
-int read_until_newline(int fd, char* buf, int max_len) {
+int read_until_newline(SSL *ssl, char* buf, int max_len) {
     int i = 0;
     char c;
     while (i < max_len - 1) {
-        if (read(fd, &c, 1) <= 0) break;
+        if (SSL_read(ssl, &c, 1) <= 0) break;
         buf[i++] = c;
         if (c == '\n') break;
     }
@@ -37,7 +39,7 @@ int read_until_newline(int fd, char* buf, int max_len) {
     return i;
 }
 
-int connect_to_server(const char* ip) {
+SSL* connect_to_server(const char* ip) {
     int sock = 0;
     struct sockaddr_in serv_addr;
     
@@ -60,13 +62,28 @@ int connect_to_server(const char* ip) {
         printf("\nConnection Failed \n");
         exit(1);
     }
-    return sock;
+    
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+    return ssl;
 }
 
 void push_file(const char* ip, const char* local_file, const char* remote_file) {
-    int sock = connect_to_server(ip);
+    SSL *ssl = connect_to_server(ip);
+    int sock = SSL_get_fd(ssl);
     char mode = '3';
-    write(sock, &mode, 1);
+    SSL_write(ssl, &mode, 1);
     
     struct stat st;
     if (stat(local_file, &st) < 0) {
@@ -80,10 +97,10 @@ void push_file(const char* ip, const char* local_file, const char* remote_file) 
     
     char header[1024];
     snprintf(header, sizeof(header), "%s\n%ld\n%lo\n%ld\n", remote_file, size, file_mode, mtime);
-    write(sock, header, strlen(header));
+    SSL_write(ssl, header, strlen(header));
     
     char resp[16];
-    read_until_newline(sock, resp, sizeof(resp));
+    read_until_newline(ssl, resp, sizeof(resp));
     if (strncmp(resp, "OK", 2) != 0) {
         printf("Server rejected push.\n");
         close(sock);
@@ -96,7 +113,7 @@ void push_file(const char* ip, const char* local_file, const char* remote_file) 
     while(sent < size) {
         int n = read(fd, buf, sizeof(buf));
         if (n <= 0) break;
-        write(sock, buf, n);
+        SSL_write(ssl, buf, n);
         sent += n;
         printf("\rProgress: %ld/%ld bytes", sent, size);
         fflush(stdout);
@@ -107,16 +124,17 @@ void push_file(const char* ip, const char* local_file, const char* remote_file) 
 }
 
 void pull_file(const char* ip, const char* remote_file, const char* local_file) {
-    int sock = connect_to_server(ip);
+    SSL *ssl = connect_to_server(ip);
+    int sock = SSL_get_fd(ssl);
     char mode = '2';
-    write(sock, &mode, 1);
+    SSL_write(ssl, &mode, 1);
     
     char header[1024];
     snprintf(header, sizeof(header), "%s\n", remote_file);
-    write(sock, header, strlen(header));
+    SSL_write(ssl, header, strlen(header));
     
     char resp[128], mode_str[128], mtime_str[128];
-    read_until_newline(sock, resp, sizeof(resp));
+    read_until_newline(ssl, resp, sizeof(resp));
     long size = atol(resp);
     if(size < 0) {
         printf("Remote file not found or error.\n");
@@ -124,11 +142,11 @@ void pull_file(const char* ip, const char* remote_file, const char* local_file) 
         return;
     }
     
-    read_until_newline(sock, mode_str, sizeof(mode_str));
+    read_until_newline(ssl, mode_str, sizeof(mode_str));
     long file_mode = strtol(mode_str, NULL, 8);
     if (file_mode == 0) file_mode = 0644;
     
-    read_until_newline(sock, mtime_str, sizeof(mtime_str));
+    read_until_newline(ssl, mtime_str, sizeof(mtime_str));
     long mtime = atol(mtime_str);
     
     int fd = open(local_file, O_WRONLY | O_CREAT | O_TRUNC, file_mode);
@@ -142,7 +160,7 @@ void pull_file(const char* ip, const char* remote_file, const char* local_file) 
     long received = 0;
     while(received < size) {
         long to_read = (size - received < (long)sizeof(buf)) ? (size - received) : (long)sizeof(buf);
-        int n = read(sock, buf, to_read);
+        int n = SSL_read(ssl, buf, to_read);
         if(n <= 0) break;
         write(fd, buf, n);
         received += n;

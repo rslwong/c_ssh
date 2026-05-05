@@ -17,6 +17,8 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8022
 
@@ -34,21 +36,21 @@ int load_config_port() {
     return parsed_port;
 }
 
-int read_exact(int fd, void *buf, size_t count) {
+int read_exact(SSL *ssl, void *buf, size_t count) {
     size_t total_read = 0;
     while (total_read < count) {
-        ssize_t n = read(fd, (char*)buf + total_read, count - total_read);
+        ssize_t n = SSL_read(ssl, (char*)buf + total_read, count - total_read);
         if (n <= 0) return (int)n;
         total_read += n;
     }
     return (int)total_read;
 }
 
-int read_until_newline(int fd, char* buf, int max_len) {
+int read_until_newline(SSL *ssl, char* buf, int max_len) {
     int i = 0;
     char c;
     while (i < max_len - 1) {
-        if (read(fd, &c, 1) <= 0) break;
+        if (SSL_read(ssl, &c, 1) <= 0) break;
         buf[i++] = c;
         if (c == '\n') break;
     }
@@ -56,21 +58,21 @@ int read_until_newline(int fd, char* buf, int max_len) {
     return i;
 }
 
-void handle_scp_pull(int client_fd) {
+void handle_scp_pull(SSL *ssl) {
     char remote_file[1024];
-    read_until_newline(client_fd, remote_file, sizeof(remote_file));
+    read_until_newline(ssl, remote_file, sizeof(remote_file));
     remote_file[strcspn(remote_file, "\n")] = 0;
     
     struct stat st;
     if (stat(remote_file, &st) < 0) {
         char err[] = "-1\n";
-        write(client_fd, err, strlen(err));
+        SSL_write(ssl, err, strlen(err));
         return;
     }
     
     char header[256];
     snprintf(header, sizeof(header), "%ld\n%lo\n%ld\n", (long)st.st_size, (long)(st.st_mode & 0777), (long)st.st_mtime);
-    write(client_fd, header, strlen(header));
+    SSL_write(ssl, header, strlen(header));
     
     int fd = open(remote_file, O_RDONLY);
     if (fd < 0) return;
@@ -80,39 +82,39 @@ void handle_scp_pull(int client_fd) {
     while(sent < st.st_size) {
         int n = read(fd, buf, sizeof(buf));
         if (n <= 0) break;
-        write(client_fd, buf, n);
+        SSL_write(ssl, buf, n);
         sent += n;
     }
     close(fd);
 }
 
-void handle_scp_push(int client_fd) {
+void handle_scp_push(SSL *ssl) {
     char remote_file[1024];
-    read_until_newline(client_fd, remote_file, sizeof(remote_file));
+    read_until_newline(ssl, remote_file, sizeof(remote_file));
     remote_file[strcspn(remote_file, "\n")] = 0;
     
     char size_str[128], mode_str[128], mtime_str[128];
-    read_until_newline(client_fd, size_str, sizeof(size_str));
+    read_until_newline(ssl, size_str, sizeof(size_str));
     long size = atol(size_str);
     
-    read_until_newline(client_fd, mode_str, sizeof(mode_str));
+    read_until_newline(ssl, mode_str, sizeof(mode_str));
     long mode = strtol(mode_str, NULL, 8);
     if (mode == 0) mode = 0644;
     
-    read_until_newline(client_fd, mtime_str, sizeof(mtime_str));
+    read_until_newline(ssl, mtime_str, sizeof(mtime_str));
     long mtime = atol(mtime_str);
     
     int fd = open(remote_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) return;
     
     char ok[] = "OK\n";
-    write(client_fd, ok, strlen(ok));
+    SSL_write(ssl, ok, strlen(ok));
     
     char buf[4096];
     long received = 0;
     while(received < size) {
         long to_read = (size - received < (long)sizeof(buf)) ? (size - received) : (long)sizeof(buf);
-        int n = read(client_fd, buf, to_read);
+        int n = SSL_read(ssl, buf, to_read);
         if (n <= 0) break;
         write(fd, buf, n);
         received += n;
@@ -126,7 +128,9 @@ void handle_scp_push(int client_fd) {
     chmod(remote_file, mode);
 }
 
-void handle_client(int client_fd) {
+void handle_client(SSL *ssl)
+{
+    int client_fd = SSL_get_fd(ssl);
     int master_fd;
     pid_t pid = forkpty(&master_fd, NULL, NULL, NULL);
     
@@ -186,23 +190,26 @@ void handle_client(int client_fd) {
                 if (tunnel_fd > max_fd) max_fd = tunnel_fd;
             }
             
-            if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
-                if (errno == EINTR) continue;
-                break;
+            int pending = SSL_pending(ssl);
+            if (pending == 0) {
+                if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
             }
             
             // Data from network, write to pty
-            if (FD_ISSET(client_fd, &fds)) {
+            if (pending > 0 || FD_ISSET(client_fd, &fds)) {
                 uint8_t type;
-                if (read_exact(client_fd, &type, 1) <= 0) break;
+                if (read_exact(ssl, &type, 1) <= 0) break;
                 uint32_t len;
-                if (read_exact(client_fd, &len, 4) <= 0) break;
+                if (read_exact(ssl, &len, 4) <= 0) break;
                 len = ntohl(len);
                 
                 if (type == 0) {
                     while (len > 0) {
                         int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                        int n = read_exact(client_fd, buffer, to_read);
+                        int n = read_exact(ssl, buffer, to_read);
                         if (n <= 0) goto disconnect;
                         write(master_fd, buffer, n);
                         len -= n;
@@ -210,12 +217,12 @@ void handle_client(int client_fd) {
                 } else if (type == 1) {
                     struct winsize ws;
                     if (len == sizeof(ws)) {
-                        if (read_exact(client_fd, &ws, sizeof(ws)) <= 0) goto disconnect;
+                        if (read_exact(ssl, &ws, sizeof(ws)) <= 0) goto disconnect;
                         ioctl(master_fd, TIOCSWINSZ, &ws);
                     } else {
                         while (len > 0) {
                             int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                            int n = read_exact(client_fd, buffer, to_read);
+                            int n = read_exact(ssl, buffer, to_read);
                             if (n <= 0) goto disconnect;
                             len -= n;
                         }
@@ -223,13 +230,13 @@ void handle_client(int client_fd) {
                 } else if (type == 2) {
                     char target[512] = {0};
                     int to_read = len > 511 ? 511 : len;
-                    if (read_exact(client_fd, target, to_read) <= 0) goto disconnect;
+                    if (read_exact(ssl, target, to_read) <= 0) goto disconnect;
                     target[to_read] = '\0';
                     if (len > 511) {
                         int drain = len - 511;
                         while (drain > 0) {
                             char dummy;
-                            if (read_exact(client_fd, &dummy, 1) <= 0) goto disconnect;
+                            if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect;
                             drain--;
                         }
                     }
@@ -257,13 +264,13 @@ void handle_client(int client_fd) {
                     
                     uint8_t t = 3;
                     uint32_t l = htonl(1);
-                    write(client_fd, &t, 1);
-                    write(client_fd, &l, 4);
-                    write(client_fd, &status, 1);
+                    SSL_write(ssl, &t, 1);
+                    SSL_write(ssl, &l, 4);
+                    SSL_write(ssl, &status, 1);
                 } else if (type == 4) {
                     while (len > 0) {
                         int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                        int n = read_exact(client_fd, buffer, to_read);
+                        int n = read_exact(ssl, buffer, to_read);
                         if (n <= 0) goto disconnect;
                         if (tunnel_fd != -1) {
                             write(tunnel_fd, buffer, n);
@@ -277,17 +284,17 @@ void handle_client(int client_fd) {
                     }
                     while (len > 0) {
                         char dummy;
-                        if (read_exact(client_fd, &dummy, 1) <= 0) goto disconnect;
+                        if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect;
                         len--;
                     }
                 } else if (type == 6) {
                     char target[128] = {0};
                     int to_read = len > 127 ? 127 : len;
-                    if (read_exact(client_fd, target, to_read) <= 0) goto disconnect;
+                    if (read_exact(ssl, target, to_read) <= 0) goto disconnect;
                     target[to_read] = '\0';
                     if (len > 127) {
                         int drain = len - 127;
-                        while(drain--) { char d; if(read_exact(client_fd, &d, 1) <= 0) goto disconnect; }
+                        while(drain--) { char d; if(read_exact(ssl, &d, 1) <= 0) goto disconnect; }
                     }
                     
                     int rport = atoi(target);
@@ -310,14 +317,14 @@ void handle_client(int client_fd) {
                     }
                     uint8_t t = 7;
                     uint32_t l = htonl(1);
-                    write(client_fd, &t, 1);
-                    write(client_fd, &l, 4);
-                    write(client_fd, &status, 1);
+                    SSL_write(ssl, &t, 1);
+                    SSL_write(ssl, &l, 4);
+                    SSL_write(ssl, &status, 1);
                 } else if (type == 9) {
                     uint8_t status;
-                    if (read_exact(client_fd, &status, 1) <= 0) goto disconnect;
+                    if (read_exact(ssl, &status, 1) <= 0) goto disconnect;
                     len--;
-                    while(len > 0) { char d; if(read_exact(client_fd, &d, 1) <= 0) goto disconnect; len--; }
+                    while(len > 0) { char d; if(read_exact(ssl, &d, 1) <= 0) goto disconnect; len--; }
                     if (status == 0 && tunnel_fd != -1) {
                         close(tunnel_fd);
                         tunnel_fd = -1;
@@ -325,7 +332,7 @@ void handle_client(int client_fd) {
                 } else {
                     while (len > 0) {
                         int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                        int n = read_exact(client_fd, buffer, to_read);
+                        int n = read_exact(ssl, buffer, to_read);
                         if (n <= 0) goto disconnect;
                         len -= n;
                     }
@@ -338,9 +345,9 @@ void handle_client(int client_fd) {
                 if (n <= 0) break;
                 uint8_t type = 0;
                 uint32_t len = htonl(n);
-                write(client_fd, &type, 1);
-                write(client_fd, &len, 4);
-                write(client_fd, buffer, n);
+                SSL_write(ssl, &type, 1);
+                SSL_write(ssl, &len, 4);
+                SSL_write(ssl, buffer, n);
             }
             
             // New connection on server remote port
@@ -353,8 +360,8 @@ void handle_client(int client_fd) {
                         tunnel_fd = new_fd;
                         uint8_t t = 8;
                         uint32_t l = htonl(0);
-                        write(client_fd, &t, 1);
-                        write(client_fd, &l, 4);
+                        SSL_write(ssl, &t, 1);
+                        SSL_write(ssl, &l, 4);
                     } else {
                         close(new_fd);
                     }
@@ -369,14 +376,14 @@ void handle_client(int client_fd) {
                     tunnel_fd = -1;
                     uint8_t t = 5;
                     uint32_t l = htonl(0);
-                    write(client_fd, &t, 1);
-                    write(client_fd, &l, 4);
+                    SSL_write(ssl, &t, 1);
+                    SSL_write(ssl, &l, 4);
                 } else {
                     uint8_t t = 4;
                     uint32_t l = htonl(n);
-                    write(client_fd, &t, 1);
-                    write(client_fd, &l, 4);
-                    write(client_fd, buffer, n);
+                    SSL_write(ssl, &t, 1);
+                    SSL_write(ssl, &l, 4);
+                    SSL_write(ssl, buffer, n);
                 }
             }
         }
@@ -390,6 +397,19 @@ disconnect:
 }
 
 int main() {
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    const SSL_METHOD *method = TLS_server_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) { perror("Unable to create SSL context"); exit(EXIT_FAILURE); }
+    if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr); exit(EXIT_FAILURE);
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr); exit(EXIT_FAILURE);
+    }
+
     int server_fd, client_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -436,18 +456,26 @@ int main() {
         if (fork() == 0) {
             close(server_fd);
             
+            SSL *ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, client_fd);
+            if (SSL_accept(ssl) <= 0) {
+                ERR_print_errors_fp(stderr);
+                exit(1);
+            }
+            
             char mode;
-            if (read(client_fd, &mode, 1) > 0) {
+            if (SSL_read(ssl, &mode, 1) > 0) {
                 if (mode == '1') {
-                    handle_client(client_fd);
+                    handle_client(ssl);
                 } else if (mode == '2') {
-                    handle_scp_pull(client_fd);
+                    handle_scp_pull(ssl);
                 } else if (mode == '3') {
-                    handle_scp_push(client_fd);
+                    handle_scp_push(ssl);
                 }
             }
             
             printf("Client disconnected.\n");
+            SSL_free(ssl);
             exit(0);
         }
         close(client_fd);

@@ -10,6 +10,8 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <errno.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8022
 
@@ -21,21 +23,21 @@ void sigwinch_handler(int sig) {
     win_resized = 1;
 }
 
-void send_window_size(int sock) {
+void send_window_size(SSL *ssl) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) return;
     
     uint8_t type = 1;
     uint32_t len = htonl(sizeof(ws));
-    write(sock, &type, 1);
-    write(sock, &len, 4);
-    write(sock, &ws, sizeof(ws));
+    SSL_write(ssl, &type, 1);
+    SSL_write(ssl, &len, 4);
+    SSL_write(ssl, &ws, sizeof(ws));
 }
 
-int read_exact(int fd, void *buf, size_t count) {
+int read_exact(SSL *ssl, void *buf, size_t count) {
     size_t total_read = 0;
     while (total_read < count) {
-        ssize_t n = read(fd, (char*)buf + total_read, count - total_read);
+        ssize_t n = SSL_read(ssl, (char*)buf + total_read, count - total_read);
         if (n <= 0) return (int)n;
         total_read += n;
     }
@@ -146,9 +148,23 @@ int main(int argc, char *argv[]) {
     
     printf("Connected to %s:%d\n", argv[1], active_port);
     
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    
     // Handshake: tell server we want an interactive shell
     char mode = '1';
-    write(sock, &mode, 1);
+    SSL_write(ssl, &mode, 1);
     
     int tunnel_listen_fd = -1;
     int tunnel_client_fd = -1;
@@ -173,9 +189,9 @@ int main(int argc, char *argv[]) {
         snprintf(payload, sizeof(payload), "%d", tunnel_listen_port);
         uint8_t t = 6;
         uint32_t l = htonl(strlen(payload));
-        write(sock, &t, 1);
-        write(sock, &l, 4);
-        write(sock, payload, strlen(payload));
+        SSL_write(ssl, &t, 1);
+        SSL_write(ssl, &l, 4);
+        SSL_write(ssl, payload, strlen(payload));
     }
     
     // Switch client terminal to raw mode
@@ -183,14 +199,14 @@ int main(int argc, char *argv[]) {
     
     sock_fd_global = sock;
     signal(SIGWINCH, sigwinch_handler);
-    send_window_size(sock);
+    send_window_size(ssl);
     
     fd_set fds;
     char buffer[4096];
     
     while (1) {
         if (win_resized) {
-            send_window_size(sock);
+            send_window_size(ssl);
             win_resized = 0;
         }
 
@@ -208,9 +224,12 @@ int main(int argc, char *argv[]) {
             if (tunnel_client_fd > max_fd) max_fd = tunnel_client_fd;
         }
         
-        if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
-            if (errno == EINTR) continue;
-            break;
+        int pending = SSL_pending(ssl);
+        if (pending == 0) {
+            if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
         }
         
         if (tunnel_listen_fd != -1 && FD_ISSET(tunnel_listen_fd, &fds)) {
@@ -224,9 +243,9 @@ int main(int argc, char *argv[]) {
                     snprintf(payload, sizeof(payload), "%s:%d", tunnel_target_ip, tunnel_target_port);
                     uint8_t t = 2;
                     uint32_t l = htonl(strlen(payload));
-                    write(sock, &t, 1);
-                    write(sock, &l, 4);
-                    write(sock, payload, strlen(payload));
+                    SSL_write(ssl, &t, 1);
+                    SSL_write(ssl, &l, 4);
+                    SSL_write(ssl, payload, strlen(payload));
                 } else {
                     close(new_fd); // Reject if already tunneling
                 }
@@ -240,14 +259,14 @@ int main(int argc, char *argv[]) {
                 tunnel_client_fd = -1;
                 uint8_t t = 5;
                 uint32_t l = htonl(0);
-                write(sock, &t, 1);
-                write(sock, &l, 4);
+                SSL_write(ssl, &t, 1);
+                SSL_write(ssl, &l, 4);
             } else {
                 uint8_t t = 4;
                 uint32_t l = htonl(n);
-                write(sock, &t, 1);
-                write(sock, &l, 4);
-                write(sock, buffer, n);
+                SSL_write(ssl, &t, 1);
+                SSL_write(ssl, &l, 4);
+                SSL_write(ssl, buffer, n);
             }
         }
         
@@ -257,23 +276,23 @@ int main(int argc, char *argv[]) {
             if (n <= 0) break;
             uint8_t type = 0;
             uint32_t len = htonl(n);
-            write(sock, &type, 1);
-            write(sock, &len, 4);
-            write(sock, buffer, n);
+            SSL_write(ssl, &type, 1);
+            SSL_write(ssl, &len, 4);
+            SSL_write(ssl, buffer, n);
         }
         
         // Read output from the server, print to the user
-        if (FD_ISSET(sock, &fds)) {
+        if (pending > 0 || FD_ISSET(sock, &fds)) {
             uint8_t type;
-            if (read_exact(sock, &type, 1) <= 0) break;
+            if (read_exact(ssl, &type, 1) <= 0) break;
             uint32_t len;
-            if (read_exact(sock, &len, 4) <= 0) break;
+            if (read_exact(ssl, &len, 4) <= 0) break;
             len = ntohl(len);
             
             if (type == 0) {
                 while (len > 0) {
                     int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                    int n = read_exact(sock, buffer, to_read);
+                    int n = read_exact(ssl, buffer, to_read);
                     if (n <= 0) goto disconnect;
                     write(STDOUT_FILENO, buffer, n);
                     len -= n;
@@ -281,7 +300,7 @@ int main(int argc, char *argv[]) {
             } else if (type == 3) {
                 uint8_t status;
                 if (len == 1) {
-                    if (read_exact(sock, &status, 1) <= 0) goto disconnect;
+                    if (read_exact(ssl, &status, 1) <= 0) goto disconnect;
                     if (status == 0 && tunnel_client_fd != -1) {
                         printf("\r\n[Tunnel connection refused by remote]\r\n");
                         close(tunnel_client_fd);
@@ -290,14 +309,14 @@ int main(int argc, char *argv[]) {
                 } else {
                     while (len > 0) {
                         char dummy;
-                        if (read_exact(sock, &dummy, 1) <= 0) goto disconnect;
+                        if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect;
                         len--;
                     }
                 }
             } else if (type == 4) {
                 while (len > 0) {
                     int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                    int n = read_exact(sock, buffer, to_read);
+                    int n = read_exact(ssl, buffer, to_read);
                     if (n <= 0) goto disconnect;
                     if (tunnel_client_fd != -1) {
                         write(tunnel_client_fd, buffer, n);
@@ -311,19 +330,19 @@ int main(int argc, char *argv[]) {
                 }
                 while (len > 0) {
                     char dummy;
-                    if (read_exact(sock, &dummy, 1) <= 0) goto disconnect;
+                    if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect;
                     len--;
                 }
             } else if (type == 7) {
                 uint8_t status;
                 if (len == 1) {
-                    if (read_exact(sock, &status, 1) <= 0) goto disconnect;
+                    if (read_exact(ssl, &status, 1) <= 0) goto disconnect;
                     if (status == 0) {
                         printf("\r\n[Server failed to bind remote port %d]\r\n", tunnel_listen_port);
                     }
                 } else {
                     while (len > 0) {
-                        char dummy; if (read_exact(sock, &dummy, 1) <= 0) goto disconnect; len--;
+                        char dummy; if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect; len--;
                     }
                 }
             } else if (type == 8) {
@@ -345,16 +364,16 @@ int main(int argc, char *argv[]) {
                 }
                 uint8_t t = 9;
                 uint32_t len_resp = htonl(1);
-                write(sock, &t, 1);
-                write(sock, &len_resp, 4);
-                write(sock, &status, 1);
+                SSL_write(ssl, &t, 1);
+                SSL_write(ssl, &len_resp, 4);
+                SSL_write(ssl, &status, 1);
                 while (len > 0) {
-                    char dummy; if (read_exact(sock, &dummy, 1) <= 0) goto disconnect; len--;
+                    char dummy; if (read_exact(ssl, &dummy, 1) <= 0) goto disconnect; len--;
                 }
             } else {
                 while (len > 0) {
                     int to_read = len > sizeof(buffer) ? sizeof(buffer) : len;
-                    int n = read_exact(sock, buffer, to_read);
+                    int n = read_exact(ssl, buffer, to_read);
                     if (n <= 0) goto disconnect;
                     len -= n;
                 }

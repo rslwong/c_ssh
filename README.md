@@ -4,6 +4,7 @@ This project provides a lightweight, minimalist implementation of an SSH-like se
 
 ## Features
 
+- **End-to-End Encryption (TLS/SSL)**: All traffic—including shell data, window resizing signals, file transfers, and port-forwarded traffic—is now securely wrapped inside an OpenSSL/TLS 1.2+ layer.
 - **Cross-Platform**: Fully compatible with both macOS and Linux, auto-detecting the appropriate system headers and `login` binaries during compilation.
 - **Interactive Remote Shell (`client`)**: Connects to the server, allocates a pseudo-terminal (`pty`), and seamlessly passes raw terminal inputs. Mimics a true SSH experience, handling interactive programs like `vim`, `top`, or `htop`.
 - **Dynamic Window Resizing**: The client listens for terminal resize events (`SIGWINCH`) and instantly synchronizes the remote server's PTY dimensions out-of-band so your UI never breaks.
@@ -32,7 +33,7 @@ To compile the server, client, and scp tools, simply run:
 make
 ```
 
-*(Note: On Linux, the Makefile will automatically link against `-lutil`.)*
+*(Note: The build process automatically links `libssl` and `libcrypto`, and will auto-generate a self-signed `server.crt` and `server.key` if they do not exist!)*
 
 ### 2. Configure (Optional)
 

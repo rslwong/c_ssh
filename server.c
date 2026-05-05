@@ -5,7 +5,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef __APPLE__
 #include <util.h> // macOS forkpty
+#else
+#include <pty.h>  // Linux forkpty
+#endif
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -135,14 +139,19 @@ void handle_client(int client_fd) {
         // Child process: set terminal environment and run a shell/login
         setenv("TERM", "xterm-256color", 1);
         
-        // Try to use login to get an SSH-like password prompt. 
-        // If run as non-root, this may just prompt for the current user's password.
+#ifdef __APPLE__
         char *args[] = {"/usr/bin/login", NULL};
         execv(args[0], args);
         
-        // Fallback to directly starting a shell if login fails or isn't available
         char *args_sh[] = {"/bin/zsh", "-l", NULL};
         execv(args_sh[0], args_sh);
+#else
+        char *args[] = {"/bin/login", NULL};
+        execv(args[0], args);
+        
+        char *args_sh[] = {"/bin/bash", "-l", NULL};
+        execv(args_sh[0], args_sh);
+#endif
         
         perror("execv");
         exit(1);

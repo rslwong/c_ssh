@@ -146,11 +146,19 @@ void handle_client(int client_fd) {
         char *args_sh[] = {"/bin/zsh", "-l", NULL};
         execv(args_sh[0], args_sh);
 #else
-        char *args[] = {"/bin/login", NULL};
-        execv(args[0], args);
+        if (getuid() == 0) {
+            char *args[] = {"/bin/login", NULL};
+            execv(args[0], args);
+        } else {
+            printf("C-SSH: Running as non-root on Linux. Bypassing native login.\n");
+            fflush(stdout);
+        }
         
         char *args_sh[] = {"/bin/bash", "-l", NULL};
         execv(args_sh[0], args_sh);
+        
+        char *args_sh2[] = {"/bin/sh", "-l", NULL};
+        execv(args_sh2[0], args_sh2);
 #endif
         
         perror("execv");

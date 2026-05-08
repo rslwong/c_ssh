@@ -4,7 +4,8 @@ This project provides a lightweight, minimalist implementation of an SSH-like se
 
 ## Features
 
-- **End-to-End Encryption (TLS/SSL)**: All traffic—including shell data, window resizing signals, file transfers, and port-forwarded traffic—is now securely wrapped inside an OpenSSL/TLS 1.2+ layer.
+- **End-to-End Encryption (TLS/SSL)**: All traffic—including shell data, window resizing signals, file transfers, and port-forwarded traffic—is securely wrapped inside an OpenSSL/TLS 1.2+ layer.
+- **Certificate Verification (Known Hosts)**: The client and SCP tools now verify the server's SHA-256 fingerprint upon connection. This implements a "trust on first use" (TOFU) security model similar to OpenSSH, protecting against Man-in-the-Middle (MITM) attacks.
 - **Cross-Platform**: Fully compatible with both macOS and Linux, auto-detecting the appropriate system headers and `login` binaries during compilation.
 - **Interactive Remote Shell (`client`)**: Connects to the server, allocates a pseudo-terminal (`pty`), and seamlessly passes raw terminal inputs. Mimics a true SSH experience, handling interactive programs like `vim`, `top`, or `htop`.
 - **Dynamic Window Resizing**: The client listens for terminal resize events (`SIGWINCH`) and instantly synchronizes the remote server's PTY dimensions out-of-band so your UI never breaks.
@@ -12,7 +13,7 @@ This project provides a lightweight, minimalist implementation of an SSH-like se
   - Local Forwarding (`-L`): Forward local ports securely to remote targets.
   - Remote Forwarding (`-R`): Bind remote ports on the server to forward traffic back to your local network.
 - **Native Authentication**: The server hooks directly into the host OS's native `/usr/bin/login` (macOS) or `/bin/login` (Linux) to offload system authentication and password verification safely.
-- **Advanced File Transfers (`c_scp`)**: A custom command-line utility providing `scp`-like push and pull capabilities. Unlike simple byte transfers, it natively fetches and preserves the original file's size, permissions (`chmod`), and last modified timestamps (`utimes`).
+- **Advanced File Transfers (`c_scp`)**: A custom command-line utility providing `scp`-like push and pull capabilities. Supports **recursive directory transfers** (`-r`) and natively fetches and preserves the original file's size, permissions (`chmod`), and last modified timestamps (`utimes`).
 - **Configuration File Support**: Easily configure the default port by creating a simple `c_ssh_config` file.
 - **Packet-Based Protocol**: Communication is structured into a dynamic custom packet protocol (`[Type][Length][Payload]`), allowing multiplexed concurrent channels for shell data, resize signals, and port forwarding streams over a single TCP connection.
 

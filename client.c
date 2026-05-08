@@ -153,12 +153,80 @@ int main(int argc, char *argv[]) {
     SSL_load_error_strings();
     const SSL_METHOD *method = TLS_client_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, sock);
     if (SSL_connect(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
+        return -1;
+    }
+
+    // Verify server certificate fingerprint
+    X509 *cert = SSL_get_peer_certificate(ssl);
+    if (cert) {
+        unsigned char md[EVP_MAX_MD_SIZE];
+        unsigned int n;
+        X509_digest(cert, EVP_sha256(), md, &n);
+        
+        char fingerprint[EVP_MAX_MD_SIZE * 3] = {0};
+        for (unsigned int i = 0; i < n; i++) {
+            sprintf(fingerprint + (i * 3), "%02X%c", md[i], (i == n - 1) ? '\0' : ':');
+        }
+        
+        int found = 0;
+        int mismatch = 0;
+        FILE *f = fopen("c_ssh_known_hosts", "r");
+        if (f) {
+            char line[1024];
+            while (fgets(line, sizeof(line), f)) {
+                char host[256], fp[256];
+                if (sscanf(line, "%s %s", host, fp) == 2) {
+                    if (strcmp(host, argv[1]) == 0) {
+                        found = 1;
+                        if (strcmp(fp, fingerprint) != 0) {
+                            mismatch = 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+        
+        if (mismatch) {
+            printf("\r\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n");
+            printf("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n");
+            printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n");
+            printf("IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n");
+            printf("Someone could be eavesdropping on you right now (man-in-the-middle attack)!\r\n");
+            printf("The SHA256 fingerprint for the %s host sent by the remote host is\r\n%s.\r\n", argv[1], fingerprint);
+            printf("Please contact your system administrator.\r\n");
+            return -1;
+        }
+        
+        if (!found) {
+            printf("The authenticity of host '%s' can't be established.\r\n", argv[1]);
+            printf("SHA256 key fingerprint is %s.\r\n", fingerprint);
+            printf("Are you sure you want to continue connecting (yes/no)? ");
+            fflush(stdout);
+            char resp[16];
+            if (fgets(resp, sizeof(resp), stdin)) {
+                if (strncmp(resp, "yes", 3) != 0) {
+                    printf("Aborted by user.\n");
+                    return -1;
+                }
+                FILE *wf = fopen("c_ssh_known_hosts", "a");
+                if (wf) {
+                    fprintf(wf, "%s %s\n", argv[1], fingerprint);
+                    fclose(wf);
+                    printf("Warning: Permanently added '%s' (SHA256) to the list of known hosts.\r\n", argv[1]);
+                }
+            } else {
+                return -1;
+            }
+        }
+        X509_free(cert);
+    } else {
+        printf("No certificate presented by server.\n");
         return -1;
     }
     

@@ -17,6 +17,7 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -58,74 +59,113 @@ int read_until_newline(SSL *ssl, char* buf, int max_len) {
     return i;
 }
 
-void handle_scp_pull(SSL *ssl) {
-    char remote_file[1024];
-    read_until_newline(ssl, remote_file, sizeof(remote_file));
-    remote_file[strcspn(remote_file, "\n")] = 0;
-    
+void send_file_pull(SSL *ssl, const char* path) {
     struct stat st;
-    if (stat(remote_file, &st) < 0) {
-        char err[] = "-1\n";
-        SSL_write(ssl, err, strlen(err));
+    if (stat(path, &st) < 0) {
+        SSL_write(ssl, "ERR\n", 4);
         return;
     }
     
-    char header[256];
-    snprintf(header, sizeof(header), "%ld\n%lo\n%ld\n", (long)st.st_size, (long)(st.st_mode & 0777), (long)st.st_mtime);
-    SSL_write(ssl, header, strlen(header));
-    
-    int fd = open(remote_file, O_RDONLY);
-    if (fd < 0) return;
-    
-    char buf[4096];
-    long sent = 0;
-    while(sent < st.st_size) {
-        int n = read(fd, buf, sizeof(buf));
-        if (n <= 0) break;
-        SSL_write(ssl, buf, n);
-        sent += n;
+    if (S_ISDIR(st.st_mode)) {
+        char header[2048];
+        snprintf(header, sizeof(header), "D %s\n%lo\n%ld\n", path, (long)(st.st_mode & 0777), (long)st.st_mtime);
+        SSL_write(ssl, header, strlen(header));
+        
+        DIR *dir = opendir(path);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+                char sub_path[2048];
+                snprintf(sub_path, sizeof(sub_path), "%s/%s", path, entry->d_name);
+                send_file_pull(ssl, sub_path);
+            }
+            closedir(dir);
+        }
+    } else {
+        char header[2048];
+        snprintf(header, sizeof(header), "F %s\n%ld\n%lo\n%ld\n", path, (long)st.st_size, (long)(st.st_mode & 0777), (long)st.st_mtime);
+        SSL_write(ssl, header, strlen(header));
+        
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[4096];
+            long sent = 0;
+            while (sent < st.st_size) {
+                int n = read(fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                SSL_write(ssl, buf, n);
+                sent += n;
+            }
+            close(fd);
+        }
     }
-    close(fd);
+}
+
+void handle_scp_pull(SSL *ssl) {
+    char remote_path[1024];
+    read_until_newline(ssl, remote_path, sizeof(remote_path));
+    remote_path[strcspn(remote_path, "\n")] = 0;
+    
+    send_file_pull(ssl, remote_path);
+    SSL_write(ssl, "Q\n", 2);
 }
 
 void handle_scp_push(SSL *ssl) {
-    char remote_file[1024];
-    read_until_newline(ssl, remote_file, sizeof(remote_file));
-    remote_file[strcspn(remote_file, "\n")] = 0;
-    
-    char size_str[128], mode_str[128], mtime_str[128];
-    read_until_newline(ssl, size_str, sizeof(size_str));
-    long size = atol(size_str);
-    
-    read_until_newline(ssl, mode_str, sizeof(mode_str));
-    long mode = strtol(mode_str, NULL, 8);
-    if (mode == 0) mode = 0644;
-    
-    read_until_newline(ssl, mtime_str, sizeof(mtime_str));
-    long mtime = atol(mtime_str);
-    
-    int fd = open(remote_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0) return;
-    
-    char ok[] = "OK\n";
-    SSL_write(ssl, ok, strlen(ok));
-    
-    char buf[4096];
-    long received = 0;
-    while(received < size) {
-        long to_read = (size - received < (long)sizeof(buf)) ? (size - received) : (long)sizeof(buf);
-        int n = SSL_read(ssl, buf, to_read);
-        if (n <= 0) break;
-        write(fd, buf, n);
-        received += n;
+    char cmd[1024];
+    while (read_until_newline(ssl, cmd, sizeof(cmd)) > 0) {
+        cmd[strcspn(cmd, "\n")] = 0;
+        if (strcmp(cmd, "Q") == 0) break;
+        
+        char type = cmd[0];
+        char *path = cmd + 2;
+        
+        if (type == 'F') {
+            char size_str[128], mode_str[128], mtime_str[128];
+            read_until_newline(ssl, size_str, sizeof(size_str));
+            long size = atol(size_str);
+            read_until_newline(ssl, mode_str, sizeof(mode_str));
+            long mode = strtol(mode_str, NULL, 8);
+            read_until_newline(ssl, mtime_str, sizeof(mtime_str));
+            long mtime = atol(mtime_str);
+            
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+            if (fd >= 0) {
+                SSL_write(ssl, "OK\n", 3);
+                char buf[4096];
+                long received = 0;
+                while (received < size) {
+                    long to_read = (size - received < (long)sizeof(buf)) ? (size - received) : (long)sizeof(buf);
+                    int n = SSL_read(ssl, buf, (int)to_read);
+                    if (n <= 0) break;
+                    write(fd, buf, n);
+                    received += n;
+                }
+                close(fd);
+                struct timeval tv[2];
+                tv[0].tv_sec = mtime; tv[0].tv_usec = 0;
+                tv[1].tv_sec = mtime; tv[1].tv_usec = 0;
+                utimes(path, tv);
+                chmod(path, mode);
+            } else {
+                SSL_write(ssl, "ERR\n", 4);
+            }
+        } else if (type == 'D') {
+            char mode_str[128], mtime_str[128];
+            read_until_newline(ssl, mode_str, sizeof(mode_str));
+            long mode = strtol(mode_str, NULL, 8);
+            read_until_newline(ssl, mtime_str, sizeof(mtime_str));
+            long mtime = atol(mtime_str);
+            
+            mkdir(path, mode);
+            struct timeval tv[2];
+            tv[0].tv_sec = mtime; tv[0].tv_usec = 0;
+            tv[1].tv_sec = mtime; tv[1].tv_usec = 0;
+            utimes(path, tv);
+            chmod(path, mode);
+            SSL_write(ssl, "OK\n", 3);
+        }
     }
-    close(fd);
-    
-    struct timeval tv[2];
-    tv[0].tv_sec = mtime; tv[0].tv_usec = 0;
-    tv[1].tv_sec = mtime; tv[1].tv_usec = 0;
-    utimes(remote_file, tv);
-    chmod(remote_file, mode);
 }
 
 void handle_client(SSL *ssl)
